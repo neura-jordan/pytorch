@@ -271,16 +271,20 @@ Tensor conv_transpose3d_mps(
       auto x = input.contiguous();
       auto x_ndhwc = x.permute({0, 2, 3, 4, 1});
 
-      // Permute weights from (Cin, Cout/groups, kD, kH, kW) -> (Cout, Cin, kD, kH, kW)
-      auto w = weight.contiguous();
-      auto w_oidhw = w.permute({1, 0, 2, 3, 4});
+      // PyTorch weights for ConvTranspose3d are (Cin, Cout/groups, kD, kH, kW).
+      // For convolution3DDataGradientWithIncomingGradientTensor, when descriptor_.weightsLayout = OIDHW,
+      // MPS expects weightsTensor (gw) to be (O_fwd, I_fwd, kD, kH, kW), where:
+      //   - O_fwd must match incomingGradientTensor.channels (x_ndhwc.channels_last = Cin).
+      //   - I_fwd will be the channel count of the operation's output.
+      // Thus, weightsTensor should be (Cin, Cout/groups, kD, kH, kW).
+      auto w_formps = weight.contiguous(); // No channel permutation {1,0,...} needed here.
 
       // 2. Initialize the graph
       MPSGraph* graph = [[MPSGraph alloc] init];
 
       // 3. Create placeholder tensors
       MPSGraphTensor* gx = TorchTensorToMPSPlaceholder(graph, x_ndhwc, /*rank=*/5, "x");
-      MPSGraphTensor* gw = TorchTensorToMPSPlaceholder(graph, w_oidhw, /*rank=*/5, "w");
+      MPSGraphTensor* gw = TorchTensorToMPSPlaceholder(graph, w_formps, /*rank=*/5, "w");
 
       // 4. Configure convolution descriptor
       MPSGraphConvolution3DOpDescriptor* conv3dDescriptor_ = [[MPSGraphConvolution3DOpDescriptor new] autorelease];
@@ -329,7 +333,7 @@ Tensor conv_transpose3d_mps(
       // 6. Prepare feeds and run the graph
       auto feeds = @{
         gx : tensorToTensorData(x_ndhwc),
-        gw : tensorToTensorData(w_oidhw)
+        gw : tensorToTensorData(w_formps)
       };
       
       // Create a *CPU* tensor to receive the NDHWC result. readBytes: copies
@@ -431,8 +435,7 @@ static Tensor conv_transpose3d_input_mps(const Tensor& grad_output,
     // grad_output shape: [N, C_out, D_out, H_out, W_out]
     // weight shape:      [C_in, C_out/groups, kD, kH, kW]
     // We compute grad_input by a forward convolution3D:
-    //   grad_input = conv3d(grad_output, weight, padding_adj, stride=dilation, dilation=stride)
-    // where padding_adj = kernel_size - 1 - padding.
+    //   grad_input = conv3d(grad_output, weight_for_fwd_conv, padding_adj, stride=dilation, dilation=stride)
 
     const int64_t kD = weight.size(2);
     const int64_t kH = weight.size(3);
@@ -443,8 +446,26 @@ static Tensor conv_transpose3d_input_mps(const Tensor& grad_output,
     int64_t padW = (kW - 1) * dilation[2] - padding[2];
 
     // Permute to NDHWC
-    auto gY = grad_output.contiguous().permute({0,2,3,4,1});
-    auto  W = weight.contiguous().permute({1,0,2,3,4}); // [C_out, C_in, kD, kH, kW]
+    auto gY_ndhwc = grad_output.contiguous().permute({0,2,3,4,1}); // grad_output (source for conv3d)
+
+    // For conv3d(source, weights_fwd, ...), source.channels must match weights_fwd.InputChannels.
+    // PyTorch weight is (Cin_tp, Cout_tp/G, k...).
+    // If descriptor_.weightsLayout = OIDHW for conv3d, it expects weights_fwd as (O_fwd, I_fwd, k...).
+    // Here, source is gY_ndhwc (Cout_tp channels). So I_fwd must be Cout_tp.
+    // O_fwd will be the output channels of conv3d, which is Cin_tp (grad_input channels).
+    // So, weights_fwd should be (Cin_tp, Cout_tp/G, k...).
+    // This means the PyTorch weight (Cin_tp, Cout_tp/G, k...) needs to be permuted to (O_fwd=Cin_tp, I_fwd=Cout_tp/G, k...).
+    // This is effectively no channel permutation if PyTorch weight is already (O_for_grad_input, I_for_grad_output, k...).
+    // The PyTorch weight is (C_in_orig, C_out_orig/G, k...).
+    // For grad_input = conv(grad_output, W_flipped), W_flipped is (C_in_orig, C_out_orig/G, k...) effectively.
+    // So, MPS OIDHW for W_flipped is (O=C_in_orig, I=C_out_orig/G, k...).
+    // The weight tensor passed to conv3DWithSourceTensor should be this W_flipped.
+    // Original weight is (C_in_transpose, C_out_transpose/G, k...). Let these be C_in_tp, C_out_tp_g.
+    // We want W_fwd to be (C_in_tp, C_out_tp_g, k...). This is the original weight.
+    auto W_fwd = weight.contiguous(); // Shape (C_in_tp, C_out_tp_g, kD, kH, kW)
+                                     // MPS interprets this as OIDHW: O=C_in_tp, I=C_out_tp_g.
+                                     // gY_ndhwc.channels (C_out_tp_g * G) must match I_fwd (C_out_tp_g). This holds for G=1.
+
     auto  X_orig_ndhwc = input.contiguous().permute({0,2,3,4,1}); // Original input permuted
 
     // Prepare output shape (NDHWC) using the original input tensor's shape
@@ -456,8 +477,8 @@ static Tensor conv_transpose3d_input_mps(const Tensor& grad_output,
     @autoreleasepool {
         MPSGraph* graph = [[MPSGraph alloc] init];
         // placeholders
-        MPSGraphTensor* gyT = TorchTensorToMPSPlaceholder(graph, gY, 5, "dY");
-        MPSGraphTensor*  wT = TorchTensorToMPSPlaceholder(graph,  W, 5, "W");
+        MPSGraphTensor* gyT = TorchTensorToMPSPlaceholder(graph, gY_ndhwc, 5, "dY");
+        MPSGraphTensor*  wT = TorchTensorToMPSPlaceholder(graph,  W_fwd, 5, "W");
 
         // descriptor
         MPSGraphConvolution3DOpDescriptor* desc = [[MPSGraphConvolution3DOpDescriptor new] autorelease];
@@ -498,8 +519,8 @@ static Tensor conv_transpose3d_input_mps(const Tensor& grad_output,
         }
 
         // run and read back
-        NSDictionary* feeds = @{ gyT : tensorToTensorData(gY),
-                                 wT  : tensorToTensorData(W) };
+        NSDictionary* feeds = @{ gyT : tensorToTensorData(gY_ndhwc),
+                                 wT  : tensorToTensorData(W_fwd) };
         // Read input-gradient into CPU tensor
         run_graph(graph, feeds, dx_ndhwc, grad_input_cpu);
         [graph release];
