@@ -3233,3 +3233,28 @@
 - name: _foreach_norm.Scalar(Tensor[] self, Scalar ord=2, ScalarType? dtype=None) -> Tensor[]
   self: norm_backward(grads[i], self[i], ord, result[i])
   result: norm_jvp(self_p, self_t, ord, result[i])
+
+- name: upsample_trilinear3d(Tensor self, SymInt[3] output_size, bool align_corners, float? scales_d=None, float? scales_h=None, float? scales_w=None) -> Tensor
+  self: upsample_trilinear3d_backward_symint(grad, output_size, self.sym_sizes(), align_corners, scales_d, scales_h, scales_w)
+  result: auto_linear
+
+- name: _upsample_trilinear3d(Tensor input, int[]? output_size, bool align_corners, float? scale_d=None, float? scale_h=None, float? scale_w=None) -> Tensor
+  input: |
+    any_grad_defined ?
+      (output_size.list.has_value()
+         ? upsample_trilinear3d_backward_symint(grad,
+                                         c10::SymIntArrayRef(std::vector<c10::SymInt>(output_size.list.value().begin(), output_size.list.value().end())),
+                                         input.sym_sizes(),
+                                         align_corners,
+                                         scale_d, scale_h, scale_w)
+         : upsample_trilinear3d_backward_symint(grad,
+                                         {input.sym_size(2), input.sym_size(3), input.sym_size(4)},
+                                         input.sym_sizes(),
+                                         align_corners,
+                                         scale_d, scale_h, scale_w))
+      : Tensor()
+  result: auto_linear
+
+- name: _upsample_nearest_exact1d(Tensor self, SymInt[1] output_size, float? scales=None) -> Tensor
+  self: _upsample_nearest_exact1d_backward_symint(grad, output_size, self.sym_sizes(), scales)
+  result: auto_linear

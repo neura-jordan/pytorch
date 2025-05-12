@@ -15862,3 +15862,22 @@
 # This op is ONLY used by pytorch/XLA in functionalization, and should never show up in vanilla eager mode or in any pytorch tracing contexts.
 - func: _propagate_xla_data(Tensor input, Tensor output) -> ()
   variants: function
+
+- func: _upsample_trilinear3d_mps(Tensor input,
+                                  int[]? output_size,
+                                  bool align_corners,
+                                  float? scale_d=None,
+                                  float? scale_h=None,
+                                  float? scale_w=None) -> Tensor
+  device_check: NoCheck
+  dispatch:
+    MPS: upsample_trilinear3d_mps
+
+- func: _upsample_trilinear3d(Tensor input,
+                              int[]? output_size,
+                              bool align_corners,
+                              float? scale_d=None,
+                              float? scale_h=None,
+                              float? scale_w=None) -> Tensor
+  dispatch:
+    MPS: _upsample_trilinear3d_mps
