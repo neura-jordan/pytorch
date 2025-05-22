@@ -390,3 +390,65 @@ android/pytorch_android_torchvision/.cxx
 .arcconfig
 .stable_pyre_client
 .pyre_client
+
+# User specific files
+.idea/
+.mypy_cache/
+.hypothesis/
+.pytest_cache/
+.python-version
+.env
+
+# Build files
+build/
+install/
+dist/
+wheelhouse/
+
+# CMake
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+compile_commands.json
+
+# Test reports
+htmlcov/
+.coverage
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Backup files
+*.bak
+*~
+
+# Buck
+ buck-out/
+.buckd/
+
+# Android
+android/pytorch_android/build/
+android/pytorch_android_torchvision/build/
+android/test_app/build/
+android/test_app/app/build/
+
+# Executables
+bin/
+
+# Visual Studio
+.vs/
+
+# macOS specific
+.DS_Store
+
+# Python generated
+__pycache__/
+*.egg-info/
+
+# User build output files
+build2.txt
+build_errors.txt
+
+# User build output files
+build2.txt
+build_errors.txt

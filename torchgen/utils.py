@@ -11,7 +11,11 @@ from dataclasses import fields, is_dataclass
 from enum import auto, Enum
 from pathlib import Path
 from typing import Any, Callable, Generic, Literal, NoReturn, TYPE_CHECKING, TypeVar
-from typing_extensions import Self
+try:
+    # In Python 3.11+, Self is available in typing
+    from typing import Self
+except ImportError:
+    from typing_extensions import Self
 
 from torchgen.code_template import CodeTemplate
 
