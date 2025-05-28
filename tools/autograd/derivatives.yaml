@@ -3279,3 +3279,9 @@
                                          scale_d, scale_h, scale_w))
       : Tensor()
   result: auto_linear
+
+- name: conv_transpose3d(Tensor input, Tensor weight, Tensor? bias=None, SymInt[3] stride=1, SymInt[3] padding=0, SymInt[3] output_padding=0, SymInt groups=1, SymInt[3] dilation=1) -> Tensor
+  input, weight, bias: "grad.defined() ? convolution_backward_symint(grad, input, weight, bias->sym_sizes(), stride, padding, dilation, true, output_padding, groups, grad_input_mask) : std::tuple<Tensor, Tensor, Tensor>()"
+
+- name: conv_transpose3d_backward(Tensor grad_output, Tensor input, Tensor weight, SymInt[]? bias_sizes, SymInt[3] stride, SymInt[3] padding, SymInt[3] output_padding, SymInt groups, SymInt[3] dilation, bool[3] output_mask) -> (Tensor, Tensor, Tensor)
+  grad_output, input, weight: _convolution_double_backward_symint(grads[0], grads[1], grads[2], grad_output, weight, input, stride, padding, dilation, true, output_padding, groups, grad_input_mask)

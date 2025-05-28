@@ -1781,7 +1781,7 @@
 - func: conv_transpose3d(Tensor input, Tensor weight, Tensor? bias=None, SymInt[3] stride=1, SymInt[3] padding=0, SymInt[3] output_padding=0, SymInt groups=1, SymInt[3] dilation=1) -> Tensor
   variants: function
   dispatch:
-    # MPS: conv_transpose3d_mps
+    MPS: conv_transpose3d_mps
     CompositeImplicitAutograd: conv_transpose3d_symint
     # derivatives: conv_transpose3d_backward
   tags: core

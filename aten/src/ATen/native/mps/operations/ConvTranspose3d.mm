@@ -600,13 +600,11 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> conv_transpose3d_backward_mps_imp
 }
 } // namespace at::native
 
-// Register the autograd implementation for the MPS key
+// Register the autograd implementation for AutogradMPS key
 TORCH_LIBRARY_IMPL(aten, AutogradMPS, m) {
-  // Register the *actual MPS implementation* kernel for the standard backward schema.
-  // The 11-arg signature of _mps_impl matches the "convolution_backward" schema.
-  // The 10-arg wrapper function above satisfies the linker/autograd codegen.
-  m.impl("convolution_backward",
-         TORCH_FN(at::native::conv_transpose3d_backward_mps_impl)); // Use the _mps_impl function
+  // Register the backward kernel for conv_transpose3d
+  m.impl("conv_transpose3d_backward",
+         TORCH_FN(at::native::conv_transpose3d_backward));
 }
 
 
