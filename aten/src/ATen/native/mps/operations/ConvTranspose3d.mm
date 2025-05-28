@@ -169,11 +169,12 @@ namespace at::native {
 TORCH_API Tensor conv_transpose3d_mps(
         const Tensor& input,
         const Tensor& weight,
+        const std::optional<Tensor>& bias,
+        IntArrayRef stride,
         IntArrayRef padding,
         IntArrayRef output_padding,
-        IntArrayRef stride,
-        IntArrayRef dilation,
-        int64_t groups);
+        int64_t groups,
+        IntArrayRef dilation);
 
 // Forward declaration for the backward function
 std::tuple<at::Tensor, at::Tensor, at::Tensor> conv_transpose3d_backward_mps_impl(
@@ -206,9 +207,12 @@ static std::vector<int64_t> calc_output_size(
     output_size[1] = weight_size[1] * groups; // output channels
     
     for (const auto d : c10::irange(dim)) {
-        auto kernel = dilation[d] * (weight_size[d + 2] - 1) + 1;
-        auto tmp = input_size[d + 2] - 1 + kernel - 2 * padding[d];
-        output_size.push_back(stride[d] * tmp + output_padding[d]);
+        // Correct PyTorch transposed convolution formula:
+        // output_size = (input_size - 1) * stride - 2 * padding + dilation * (kernel_size - 1) + output_padding + 1
+        auto kernel_size = weight_size[d + 2];
+        auto dilated_kernel_size = dilation[d] * (kernel_size - 1) + 1;
+        auto output_dim = (input_size[d + 2] - 1) * stride[d] - 2 * padding[d] + dilated_kernel_size + output_padding[d];
+        output_size.push_back(output_dim);
     }
     
     return output_size;
@@ -249,11 +253,12 @@ static void fill_conv3d_desc(MPSGraphConvolution3DOpDescriptor* descriptor_,
 Tensor conv_transpose3d_mps(
         const Tensor& input,
         const Tensor& weight,
+        const std::optional<Tensor>& bias,
+        IntArrayRef stride,
         IntArrayRef padding,
         IntArrayRef output_padding,
-        IntArrayRef stride,
-        IntArrayRef dilation,
-        int64_t groups) {
+        int64_t groups,
+        IntArrayRef dilation) {
 
   TORCH_CHECK(groups == 1, "MPS ConvTranspose3d currently only supports groups==1");
   TORCH_CHECK(input.device().is_mps() && weight.device().is_mps(),
@@ -272,12 +277,13 @@ Tensor conv_transpose3d_mps(
       auto x_ndhwc = x.permute({0, 2, 3, 4, 1});
 
       // PyTorch weights for ConvTranspose3d are (Cin, Cout/groups, kD, kH, kW).
-      // For convolution3DDataGradientWithIncomingGradientTensor, when descriptor_.weightsLayout = OIDHW,
-      // MPS expects weightsTensor (gw) to be (O_fwd, I_fwd, kD, kH, kW), where:
-      //   - O_fwd must match incomingGradientTensor.channels (x_ndhwc.channels_last = Cin).
-      //   - I_fwd will be the channel count of the operation's output.
-      // Thus, weightsTensor should be (Cin, Cout/groups, kD, kH, kW).
-      auto w_formps = weight.contiguous(); // No channel permutation {1,0,...} needed here.
+      // For convolution3DDataGradientWithIncomingGradientTensor, we need to think about
+      // what forward convolution would produce our input from our desired output.
+      // The data gradient API computes: input = conv3d_data_grad(output, weight_fwd)
+      // For transposed conv: output = conv_transpose3d(input, weight_transpose)
+      // This is equivalent to: output = conv3d_data_grad(input, weight_fwd)
+      // where weight_fwd should be weight_transpose with no permutation for OIDHW layout
+      auto w_formps = weight.contiguous();
 
       // 2. Initialize the graph
       MPSGraph* graph = [[MPSGraph alloc] init];
@@ -300,7 +306,7 @@ Tensor conv_transpose3d_mps(
                        /*paddingDepth*/ padding[0],
                        /*groups*/ groups);
 
-      // 5. Create convolutionTranspose3D operation using native API
+      // 5. Create convolutionTranspose3D operation using data gradient API
       NSArray* outputShapeArr = @[
           @(out_sizes[0]),   // N
           @(out_sizes[2]),   // D
@@ -309,9 +315,7 @@ Tensor conv_transpose3d_mps(
           @(out_sizes[1])    // C_out
       ];
 
-      // Use the data gradient API instead of the transposed convolution API
-      // (mathematically equivalent, but available on more macOS versions)
-      // Detect available graph APIs for 3D data gradient
+      // Use the data gradient API (mathematically equivalent to transposed convolution)
       SEL selModernDataGrad = @selector(convolution3DDataGradientWithIncomingGradientTensor:weightsTensor:outputShape:forwardConvolutionDescriptor:name:);
       SEL selLegacyDataGrad = @selector(convolution3DDataGradientWithIncomingGradientTensor:weightsTensor:forwardConvolutionDescriptor:name:);
       MPSGraphTensor* gy_ndhwc = nil;
@@ -352,6 +356,11 @@ Tensor conv_transpose3d_mps(
     } else {
       TORCH_CHECK(false, "3D transposed convolution on MPS requires macOS 14+ / Xcode 15+");
     }
+  }
+  
+  // Add bias if provided
+  if (bias.has_value()) {
+    output = output + bias.value().view({1, -1, 1, 1, 1});
   }
   
   return output;
@@ -455,16 +464,9 @@ static Tensor conv_transpose3d_input_mps(const Tensor& grad_output,
     // O_fwd will be the output channels of conv3d, which is Cin_tp (grad_input channels).
     // So, weights_fwd should be (Cin_tp, Cout_tp/G, k...).
     // This means the PyTorch weight (Cin_tp, Cout_tp/G, k...) needs to be permuted to (O_fwd=Cin_tp, I_fwd=Cout_tp/G, k...).
-    // This is effectively no channel permutation if PyTorch weight is already (O_for_grad_input, I_for_grad_output, k...).
-    // The PyTorch weight is (C_in_orig, C_out_orig/G, k...).
-    // For grad_input = conv(grad_output, W_flipped), W_flipped is (C_in_orig, C_out_orig/G, k...) effectively.
-    // So, MPS OIDHW for W_flipped is (O=C_in_orig, I=C_out_orig/G, k...).
-    // The weight tensor passed to conv3DWithSourceTensor should be this W_flipped.
-    // Original weight is (C_in_transpose, C_out_transpose/G, k...). Let these be C_in_tp, C_out_tp_g.
-    // We want W_fwd to be (C_in_tp, C_out_tp_g, k...). This is the original weight.
-    auto W_fwd = weight.contiguous(); // Shape (C_in_tp, C_out_tp_g, kD, kH, kW)
-                                     // MPS interprets this as OIDHW: O=C_in_tp, I=C_out_tp_g.
-                                     // gY_ndhwc.channels (C_out_tp_g * G) must match I_fwd (C_out_tp_g). This holds for G=1.
+    // For MPS OIDHW format, the transposed conv weight (Cin, Cout, kD, kH, kW) is already
+    // in the correct format for the forward conv weight used in the data gradient computation.
+    auto W_fwd = weight.contiguous(); // No permutation needed
 
     auto  X_orig_ndhwc = input.contiguous().permute({0,2,3,4,1}); // Original input permuted
 
@@ -610,7 +612,7 @@ TORCH_LIBRARY_IMPL(aten, AutogradMPS, m) {
 
 // Register with dispatcher for MPS
 TORCH_LIBRARY_IMPL(aten, MPS, m) {
-  // Register the forward kernel for the internal MPS dispatch mechanism
-  m.impl("_mps_convolution_transpose", // <-- CORRECT NAME
+  // Register the forward kernel for conv_transpose3d
+  m.impl("conv_transpose3d", // <-- CORRECT NAME
          TORCH_FN(at::native::conv_transpose3d_mps));
 }
